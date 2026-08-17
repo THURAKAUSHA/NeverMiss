@@ -12,7 +12,7 @@ on:
 jobs:
   run-nevermiss:
 
-    # GitHub provides a temporary Linux computer
+    # GitHub gives NeverMiss a temporary cloud computer
     runs-on: ubuntu-latest
 
     steps:
@@ -31,7 +31,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Give NeverMiss access to the API keys
+      # Create Gmail authentication files from GitHub Secrets
+      - name: Set up Gmail authentication
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
+        run: |
+          printf '%s' "$GOOGLE_CREDENTIALS" > credentials.json
+          printf '%s' "$GOOGLE_TOKEN" > token.json
+
+      # Run NeverMiss
       - name: Run NeverMiss
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
