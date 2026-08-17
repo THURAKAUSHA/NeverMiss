@@ -1,0 +1,40 @@
+# NeverMiss automatic workflow
+
+name: NeverMiss
+
+# Run manually for testing and automatically every 15 minutes
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "*/15 * * * *"
+
+jobs:
+  run-nevermiss:
+
+    # GitHub provides a temporary Linux computer
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # Download the NeverMiss project
+      - name: Get NeverMiss code
+        uses: actions/checkout@v4
+
+      # Install Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Install the packages NeverMiss needs
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Give NeverMiss access to the API keys
+      - name: Run NeverMiss
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python nevermiss.py
