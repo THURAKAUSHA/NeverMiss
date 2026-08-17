@@ -6,27 +6,36 @@ import requests
 
 from dotenv import load_dotenv
 from groq import Groq
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 
-# Load environment variables
+# LOAD ENVIRONMENT VARIABLES
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly"
+]
+
 SENT_IDS_FILE = "sent_ids.json"
+FAIL_COUNTS_FILE = "fail_counts.json"
+MAX_RETRIES = 2  # after this many failures, give up on the email and mark it processed
 
 client = Groq(api_key=GROQ_API_KEY)
 
 
-# Send notifications through Telegram
+# SEND MESSAGE TO TELEGRAM
+
 def send_telegram(text):
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     try:
@@ -40,34 +49,46 @@ def send_telegram(text):
         )
 
         print("Telegram response:", response.status_code)
+
         return response.status_code == 200
 
     except requests.exceptions.RequestException as e:
+
         print("Telegram error:", e)
+
         return False
 
 
-# Connect to Gmail
+# CONNECT TO GMAIL
+
 def get_gmail_service():
+
     creds = None
 
     if os.path.exists("token.json"):
+
         creds = Credentials.from_authorized_user_file(
             "token.json",
             SCOPES
         )
 
     if not creds or not creds.valid:
+
         if creds and creds.expired and creds.refresh_token:
+
             creds.refresh(Request())
+
         else:
+
             flow = InstalledAppFlow.from_client_secrets_file(
                 "credentials.json",
                 SCOPES
             )
+
             creds = flow.run_local_server(port=0)
 
         with open("token.json", "w") as token:
+
             token.write(creds.to_json())
 
     return build(
@@ -77,31 +98,67 @@ def get_gmail_service():
     )
 
 
-# Keep track of emails that have already been processed
+# REMEMBER PROCESSED EMAILS
+
 def load_sent_ids():
+
     if os.path.exists(SENT_IDS_FILE):
+
         with open(SENT_IDS_FILE, "r") as file:
+
             return set(json.load(file))
 
     return set()
 
 
 def save_sent_ids(ids):
+
     with open(SENT_IDS_FILE, "w") as file:
-        json.dump(list(ids), file)
+
+        json.dump(
+            list(ids),
+            file
+        )
 
 
-# Extract readable text from Gmail messages
+# TRACK PER-EMAIL AI FAILURE COUNTS (so broken emails don't retry forever)
+
+def load_fail_counts():
+
+    if os.path.exists(FAIL_COUNTS_FILE):
+
+        with open(FAIL_COUNTS_FILE, "r") as file:
+
+            return json.load(file)
+
+    return {}
+
+
+def save_fail_counts(counts):
+
+    with open(FAIL_COUNTS_FILE, "w") as file:
+
+        json.dump(
+            counts,
+            file
+        )
+
+
+# EXTRACT EMAIL BODY
+
 def get_email_body(payload):
+
     body = ""
 
     if "parts" in payload:
+
         for part in payload["parts"]:
 
             if (
                 part.get("mimeType") == "text/plain"
                 and "data" in part.get("body", {})
             ):
+
                 data = part["body"]["data"]
 
                 body += base64.urlsafe_b64decode(
@@ -112,9 +169,11 @@ def get_email_body(payload):
                 )
 
             elif "parts" in part:
+
                 body += get_email_body(part)
 
     elif payload.get("body", {}).get("data"):
+
         data = payload["body"]["data"]
 
         body += base64.urlsafe_b64decode(
@@ -127,8 +186,10 @@ def get_email_body(payload):
     return body.strip()
 
 
-# Skip obvious promotional and social emails before using AI
+# FILTER UNNECESSARY EMAILS
+
 def should_analyze_email(subject, sender):
+
     text = f"{subject} {sender}".lower()
 
     skip_keywords = [
@@ -151,58 +212,92 @@ def should_analyze_email(subject, sender):
     ]
 
     for keyword in skip_keywords:
+
         if keyword in text:
+
             return False
 
     return True
 
 
-# Analyze emails using Llama through Groq
+# ANALYZE EMAIL USING GROQ AI
+
 def analyze_email(subject, sender, body):
+
+    # Digest-style alerts ("X and 11 more new jobs") confuse the strict
+    # single-job JSON schema below, since the model tries to describe
+    # every listed job instead of one. Truncate the body harder for these
+    # so the model only "sees" roughly the first job.
+    if " and " in subject.lower() and "more" in subject.lower():
+        body = body[:1500]
+    else:
+        body = body[:4000]
+
     prompt = f"""
-You are NeverMiss, an AI assistant that helps users avoid missing
-important emails.
+You are NeverMiss, an AI career assistant.
 
-Analyze the email and return ONLY valid JSON.
+Analyze this email for a job seeker.
 
-Use exactly these fields:
+Identify whether this email is:
 
-{{
-    "category": "INTERVIEW | ASSESSMENT | JOB | OFFER | REJECTION | DEADLINE | URGENT | PROMOTION | SOCIAL | NORMAL",
-    "priority": "HIGH | MEDIUM | LOW",
-    "company": "company name or Unknown",
-    "role": "job role or Unknown",
-    "summary": "maximum 25 words",
-    "deadline": "date/time if mentioned, otherwise None",
-    "action": "what the user should do, otherwise None",
-    "application_link": "URL if present, otherwise None"
-}}
+INTERVIEW:
+Interview invitation or interview scheduling.
 
-Rules:
+ASSESSMENT:
+Coding test, online assessment, hackathon, exam or test.
 
-- Interview invitation → INTERVIEW
-- Coding test, assessment or exam → ASSESSMENT
-- Job opening or hiring notification → JOB
-- Offer or selection confirmation → OFFER
-- Rejection → REJECTION
-- Important deadline → DEADLINE
-- Time-sensitive important email → URGENT
-- Marketing → PROMOTION
-- Social media → SOCIAL
-- Everything else → NORMAL
+JOB:
+Job opening, hiring notification or job alert.
 
-Priority:
+OFFER:
+Offer letter, selection confirmation or joining confirmation.
 
-- HIGH = interview, assessment, offer, urgent deadline or important action
-- MEDIUM = job opportunity or useful information
-- LOW = non-urgent information
+REJECTION:
+Rejected, not selected or application unsuccessful.
+
+DEADLINE:
+Important application or assessment deadline.
+
+URGENT:
+Important time-sensitive email requiring attention.
+
+PROMOTION:
+Marketing, advertising, shopping or promotional email.
+
+SOCIAL:
+Social media notification.
+
+NORMAL:
+Everything else.
+
+Priority rules:
+
+HIGH:
+Interview, assessment, offer, urgent issue or important action.
+
+MEDIUM:
+Useful job opportunity or useful career information.
+
+LOW:
+Non-urgent information.
 
 Never invent information.
-Use Unknown or None when information is missing.
-Extract an application URL if one exists.
-The user may apply for different types of jobs.
-Do not calculate a job match score.
-Keep the summary short.
+
+If this email lists multiple jobs, describe only the FIRST job mentioned
+and summarize that the email also references other openings.
+
+If information is missing:
+company = Unknown
+role = Unknown
+deadline = None
+action = None
+application_link = None
+
+Keep the summary short and simple.
+
+Respond with ONLY a single JSON object with exactly these keys:
+category, priority, company, role, summary, deadline, action, application_link.
+No other text, no markdown, no code fences.
 
 From:
 {sender}
@@ -211,34 +306,118 @@ Subject:
 {subject}
 
 Email:
-{body[:4000]}
+{body}
 """
 
-    try:
-        response = client.chat.completions.create(
+    JSON_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "enum": [
+                    "INTERVIEW",
+                    "ASSESSMENT",
+                    "JOB",
+                    "OFFER",
+                    "REJECTION",
+                    "DEADLINE",
+                    "URGENT",
+                    "PROMOTION",
+                    "SOCIAL",
+                    "NORMAL"
+                ]
+            },
+            "priority": {
+                "type": "string",
+                "enum": ["HIGH", "MEDIUM", "LOW"]
+            },
+            "company": {"type": "string"},
+            "role": {"type": "string"},
+            "summary": {"type": "string"},
+            "deadline": {"type": "string"},
+            "action": {"type": "string"},
+            "application_link": {"type": "string"}
+        },
+        "required": [
+            "category", "priority", "company", "role",
+            "summary", "deadline", "action", "application_link"
+        ],
+        "additionalProperties": False
+    }
+
+    SYSTEM_MESSAGE = (
+        "You are NeverMiss AI. "
+        "Analyze emails accurately and "
+        "follow the required JSON structure."
+    )
+
+    def call_groq(response_format):
+        return client.chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=[
-                {
-                    "role": "system",
-                    "content": "Return only valid JSON."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "system", "content": SYSTEM_MESSAGE},
+                {"role": "user", "content": prompt}
             ],
+            response_format=response_format,
             temperature=0.1,
-            max_tokens=400
+            # gpt-oss-20b is a reasoning model: reasoning tokens count
+            # against max_tokens, so keep this generous or the JSON can
+            # get cut off mid-generation and fail schema validation.
+            max_tokens=1200,
+            reasoning_effort="low"
         )
 
-        result = response.choices[0].message.content.strip()
+    # ATTEMPT 1: strict json_schema mode (best guarantees, but has a
+    # known Groq bug on gpt-oss-20b where it can 400 with an empty
+    # failed_generation on some inputs)
+    try:
 
-        print("Groq result:")
+        response = call_groq({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "never_miss_email",
+                "strict": True,
+                "schema": JSON_SCHEMA
+            }
+        })
+
+        result = response.choices[0].message.content
+
+        if not result:
+            raise ValueError("Groq returned an empty response.")
+
+        result = result.strip()
+
+        print("Groq result (schema mode):")
         print(result)
 
         return json.loads(result)
 
     except Exception as e:
+
+        print("Groq schema-mode error, falling back to json_object mode:", e)
+
+    # ATTEMPT 2: fallback to looser json_object mode. Less strict, but
+    # community reports show it's far more reliable for gpt-oss-20b,
+    # and our prompt already spells out the exact fields we want.
+    try:
+
+        response = call_groq({"type": "json_object"})
+
+        result = response.choices[0].message.content
+
+        if not result:
+            raise ValueError("Groq returned an empty response.")
+
+        result = result.strip()
+
+        print("Groq result (json_object fallback):")
+        print(result)
+
+        return json.loads(result)
+
+    except Exception as e:
+
         print("Groq error:", e)
 
         return {
@@ -253,13 +432,16 @@ Email:
         }
 
 
-# Check unread Gmail messages and process new emails
+# GET UNREAD EMAILS
+
 def get_emails():
+
     service = get_gmail_service()
 
     print("Connected to Gmail!")
 
     sent_ids = load_sent_ids()
+    fail_counts = load_fail_counts()
 
     results = service.users().messages().list(
         userId="me",
@@ -268,9 +450,14 @@ def get_emails():
         maxResults=10
     ).execute()
 
-    messages = results.get("messages", [])
+    messages = results.get(
+        "messages",
+        []
+    )
 
-    print(f"Found {len(messages)} unread emails")
+    print(
+        f"Found {len(messages)} unread emails"
+    )
 
     new_messages = [
         message
@@ -284,12 +471,16 @@ def get_emails():
     )
 
     if not new_messages:
+
         print("No new emails to process.")
+
         return
+
+
+    # PROCESS EACH EMAIL
 
     for msg in new_messages:
 
-        # Get the complete email
         email = service.users().messages().get(
             userId="me",
             id=msg["id"]
@@ -297,7 +488,9 @@ def get_emails():
 
         headers = email["payload"]["headers"]
 
-        # Get the subject
+
+        # GET EMAIL SUBJECT
+
         subject = next(
             (
                 h["value"]
@@ -307,7 +500,9 @@ def get_emails():
             "No Subject"
         )
 
-        # Get the sender
+
+        # GET EMAIL SENDER
+
         sender_raw = next(
             (
                 h["value"]
@@ -319,39 +514,81 @@ def get_emails():
 
         sender = sender_raw.split("<")[0].strip()
 
-        # Skip obvious junk without spending Groq tokens
-        if not should_analyze_email(subject, sender):
-            print(f"Skipping without AI: {subject}")
+
+        # SKIP OBVIOUS PROMOTIONAL EMAILS
+
+        if not should_analyze_email(
+            subject,
+            sender
+        ):
+
+            print(
+                f"Skipping without AI: {subject}"
+            )
 
             sent_ids.add(msg["id"])
+
             continue
 
-        # Extract the email body
-        body = get_email_body(email["payload"])
 
-        print(f"\nAnalyzing: {subject}")
+        # GET EMAIL BODY
 
-        # Ask Llama to analyze the email
+        body = get_email_body(
+            email["payload"]
+        )
+
+
+        # ANALYZE EMAIL
+
+        print(
+            f"\nAnalyzing: {subject}"
+        )
+
         ai_result = analyze_email(
             subject,
             sender,
             body
         )
 
-        # If AI fails, retry this email later
+
+        # RETRY EMAIL IF AI FAILS, BUT GIVE UP AFTER MAX_RETRIES
+
         if ai_result["category"] == "AI_ERROR":
-            print(
-                "AI analysis failed. "
-                "Will retry later."
-            )
+
+            fail_counts[msg["id"]] = fail_counts.get(msg["id"], 0) + 1
+
+            if fail_counts[msg["id"]] >= MAX_RETRIES:
+
+                print(
+                    f"AI analysis failed {fail_counts[msg['id']]} times. "
+                    f"Giving up on this email and marking it processed."
+                )
+
+                sent_ids.add(msg["id"])
+                fail_counts.pop(msg["id"], None)
+
+            else:
+
+                print(
+                    f"AI analysis failed "
+                    f"({fail_counts[msg['id']]}/{MAX_RETRIES}). "
+                    f"Will retry next run."
+                )
+
             continue
 
-        # Don't send unnecessary notifications
+        # Clear any prior failure count now that analysis succeeded
+        fail_counts.pop(msg["id"], None)
+
+
+        # SKIP UNIMPORTANT EMAILS
+
         if ai_result["category"] in [
             "NORMAL",
             "PROMOTION",
             "SOCIAL"
         ]:
+
             print(
                 f"Skipping irrelevant email: "
                 f"{subject} "
@@ -359,19 +596,29 @@ def get_emails():
             )
 
             sent_ids.add(msg["id"])
+
             continue
 
-        # Choose an icon based on priority
+
+        # CHOOSE TELEGRAM ICON
+
         priority = ai_result["priority"]
 
         if priority == "HIGH":
+
             icon = "🚨"
+
         elif priority == "MEDIUM":
+
             icon = "🔔"
+
         else:
+
             icon = "ℹ️"
 
-        # Create the Telegram notification
+
+        # CREATE TELEGRAM MESSAGE
+
         message = f"""
 {icon} NEVERMISS — {ai_result["category"]}
 
@@ -388,29 +635,61 @@ def get_emails():
 {ai_result["action"]}
 """
 
+
+        # ADD APPLICATION LINK
+
         if ai_result["application_link"] != "None":
+
             message += f"""
 🔗 Application:
 {ai_result["application_link"]}
 """
+
+
+        # ADD SENDER
 
         message += f"""
 ━━━━━━━━━━━━━━━━━━━━
 📧 From: {sender}
 """
 
-        # Send the notification
-        if send_telegram(message):
-            sent_ids.add(msg["id"])
+
+        # SEND TELEGRAM MESSAGE
+
+        success = send_telegram(
+            message
+        )
+
+        if success:
+
+            sent_ids.add(
+                msg["id"]
+            )
 
         time.sleep(3)
 
-    # Save processed email IDs
-    save_sent_ids(sent_ids)
+
+    # SAVE PROCESSED EMAILS AND FAILURE COUNTS
+
+    save_sent_ids(
+        sent_ids
+    )
+
+    save_fail_counts(
+        fail_counts
+    )
 
 
-# Start NeverMiss
+# START NEVERMISS
+
 if __name__ == "__main__":
-    print("Starting NeverMiss...")
+
+    print(
+        "Starting NeverMiss..."
+    )
+
     get_emails()
-    print("Done!")
+
+    print(
+        "Done!"
+    )
