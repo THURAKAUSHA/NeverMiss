@@ -9,6 +9,7 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
+
 jobs:
   run-nevermiss:
 
@@ -17,9 +18,10 @@ jobs:
 
     steps:
 
-      # Download the NeverMiss project
+      # Download the NeverMiss project from GitHub
       - name: Get NeverMiss code
         uses: actions/checkout@v4
+
 
       # Install Python
       - name: Set up Python
@@ -27,9 +29,11 @@ jobs:
         with:
           python-version: "3.12"
 
+
       # Install the packages NeverMiss needs
       - name: Install dependencies
         run: pip install -r requirements.txt
+
 
       # Create Gmail authentication files from GitHub Secrets
       - name: Set up Gmail authentication
@@ -40,6 +44,17 @@ jobs:
           printf '%s' "$GOOGLE_CREDENTIALS" > credentials.json
           printf '%s' "$GOOGLE_TOKEN" > token.json
 
+
+      # Restore the list of emails already sent to Telegram
+      - name: Restore email tracking
+        uses: actions/cache/restore@v4
+        with:
+          path: sent_ids.json
+          key: nevermiss-sent-ids-${{ github.run_id }}
+          restore-keys: |
+            nevermiss-sent-ids-
+
+
       # Run NeverMiss
       - name: Run NeverMiss
         env:
@@ -47,3 +62,11 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python nevermiss.py
+
+
+      # Save the updated email tracking for the next run
+      - name: Save email tracking
+        uses: actions/cache/save@v4
+        with:
+          path: sent_ids.json
+          key: nevermiss-sent-ids-${{ github.run_id }}
