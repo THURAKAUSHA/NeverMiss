@@ -1,0 +1,11 @@
+# Private credentials
+.env
+credentials.json
+token.json
+
+# Local email tracking
+sent_ids.json
+
+# Python cache
+__pycache__/
+*.pyc
